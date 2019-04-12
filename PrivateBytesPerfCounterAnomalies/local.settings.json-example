@@ -8,6 +8,7 @@
     "AnomalyDetectionSubscriptionKey": "<--subscription key of anomaly detector service-->",
     "AnomalyDetectionEndpoint": "<--endpoint of anomaly detector service-->",
     "AnomalyDetectionLatestPointDetectionUrl": "/anomalydetector/v1.0/timeseries/last/detect",
-    "AnomalyDetectionBatchDetectionUrl": "/anomalydetector/v1.0/timeseries/entire/detect"
+    "AnomalyDetectionBatchDetectionUrl": "/anomalydetector/v1.0/timeseries/entire/detect",
+    "AzureAiQueryMinutesAgo": 10
   }
 }

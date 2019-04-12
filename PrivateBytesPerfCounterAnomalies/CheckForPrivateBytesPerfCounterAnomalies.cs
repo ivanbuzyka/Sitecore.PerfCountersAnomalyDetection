@@ -7,6 +7,7 @@ using Newtonsoft.Json;
 using PrivateBytesPerfCounterAnomalies.Domain.AnomalyDetection;
 using PrivateBytesPerfCounterAnomalies.Domain.AppInsightsParsing;
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
@@ -24,6 +25,7 @@ namespace PrivateBytesPerfCounterAnomalies
         private static string AnomalyDetectionEndpoint = Environment.GetEnvironmentVariable("AnomalyDetectionEndpoint", EnvironmentVariableTarget.Process);
         private static string AnomalyDetectionLatestPointDetectionUrl = Environment.GetEnvironmentVariable("AnomalyDetectionLatestPointDetectionUrl", EnvironmentVariableTarget.Process);
         private static string AnomalyDetectionBatchDetectionUrl = Environment.GetEnvironmentVariable("AnomalyDetectionBatchDetectionUrl", EnvironmentVariableTarget.Process);
+        private static string AzureAiQueryMinutesAgo = Environment.GetEnvironmentVariable("AzureAiQueryMinutesAgo", EnvironmentVariableTarget.Process);
 
         [FunctionName("CheckForPrivateBytesPerfCounterAnomalies")]
         public static async Task<IActionResult> Run(
@@ -32,44 +34,58 @@ namespace PrivateBytesPerfCounterAnomalies
         {
             log.LogInformation("C# HTTP trigger function processed a request.");
 
-            //converting data from specific Application Insigts response format to the one suitable for Anomaly Detection
-            var result = JsonConvert.DeserializeObject<TablesResult>(GetTelemetry());
-            var rows = result.Tables.First();
+            // getting data from application insights
+            var anomalyDetectionData = GetAppInsightsPrivateBytesTelemetry(log);
 
-            var andetData = new AndetDataCollection();
-            andetData.Series = rows.Rows.Select(i => new PerfCounterRow() { Timestamp = DateTime.Parse(i[0]), Value = (long)double.Parse(i[1]) }).OrderBy(i => i.Timestamp).ToList();
+            // posting App Insights data to anomaly detector and getting result with anomaly rows
+            var anomalyDataRows = GetAnomalyPerfCountersRows(anomalyDetectionData, log);
 
-            var cnt = andetData.Series.Count();
-
-            JsonSerializer serializer = new JsonSerializer
-            {
-                NullValueHandling = NullValueHandling.Ignore
-            };
-
-            andetData.Granularity = "minutely";
-
-            var json = JsonConvert.SerializeObject(andetData, Formatting.None, new JsonSerializerSettings
+            var anomalyDataRowsJson = JsonConvert.SerializeObject(anomalyDataRows, Formatting.Indented, new JsonSerializerSettings
             {
                 DateTimeZoneHandling = DateTimeZoneHandling.Utc,
                 DateFormatString = "s"
             });
 
-            log.LogInformation($"ApplicatrionInsights. JSON prepared for Anomaly Detection: \n\r {json}");
+            return new OkObjectResult(anomalyDataRowsJson);
+            // if not successfull:
+            // new BadRequestObjectResult("Please pass a name on the query string or in the request body");
+        }
+
+        #region private methods
+
+        private static IEnumerable<PerfCounterRow> GetAnomalyPerfCountersRows(AndetDataCollection dataCollection, ILogger log)
+        {
+            var result = new List<PerfCounterRow>();
+
+            var json = JsonConvert.SerializeObject(dataCollection, Formatting.None, new JsonSerializerSettings
+            {
+                DateTimeZoneHandling = DateTimeZoneHandling.Utc,
+                DateFormatString = "s"
+            });
+
+            log.LogInformation($"ApplicationInsights. JSON prepared for Anomaly Detection: \n\r {json}");
 
             //send perf counters to Anomaly Detection
             var anomalyDetectionResult = DetectAnomaliesBatch(json);
+
             //var anomalyDetectionResult = DetectAnomaliesLatest(json);
             if (anomalyDetectionResult.Contains("ErrorCode:"))
             {
-                return new BadRequestObjectResult(anomalyDetectionResult);
+                log.LogError(anomalyDetectionResult);
+                return result;
             }
 
-            return new OkObjectResult(anomalyDetectionResult);
-            //
+            var intermediateResult = JsonConvert.DeserializeObject<AndetResponseData>(anomalyDetectionResult);
 
-            //return (ActionResult)new OkObjectResult(json);
-            // if not successfull:
-            // new BadRequestObjectResult("Please pass a name on the query string or in the request body");
+            // selecting indexes of all anomaly rows
+            int[] anomalyRowsIndexes = intermediateResult.IsAnomaly.Select((value, index) => new { value, index })
+                .Where(t => t.value)
+                .Select(t => t.index)
+                .ToArray();
+
+            result = anomalyRowsIndexes.Select(i => new PerfCounterRow() { Timestamp = dataCollection.Series[i].Timestamp, Value = dataCollection.Series[i].Value }).ToList();
+
+            return result;
         }
 
         private static string DetectAnomaliesBatch(string requestData)
@@ -115,29 +131,55 @@ namespace PrivateBytesPerfCounterAnomalies
             }
         }
 
-        public static string GetTelemetry()
+        public static AndetDataCollection GetAppInsightsPrivateBytesTelemetry(ILogger log)
         {
+            var result = new AndetDataCollection
+            {
+                Granularity = "minutely"
+            };
+
             HttpClient client = new HttpClient();
             client.DefaultRequestHeaders.Accept.Add(
                 new MediaTypeWithQualityHeaderValue("application/json"));
             client.DefaultRequestHeaders.Add("x-api-key", AzureAiApiKey);
-            HttpResponseMessage response = client.GetAsync(GenerateAppInsightsQuery()).Result;
-            if (response.IsSuccessStatusCode)
+            HttpResponseMessage response = client.GetAsync(GenerateAppInsightsPrivateBytesQuery()).Result;
+
+            if (!response.IsSuccessStatusCode)
             {
-                return response.Content.ReadAsStringAsync().Result;
+                log.LogError($"Error when getting telemetry data from App Insights: {response.Content.ReadAsStringAsync().Result}");
+                return result;
             }
-            else
-            {
-                return response.ReasonPhrase;
-            }
+
+            var intermediateResult = JsonConvert.DeserializeObject<TablesResult>(response.Content.ReadAsStringAsync().Result);
+            var rows = intermediateResult.Tables.First();
+                        
+            result.Series = rows.Rows.Select(i => new PerfCounterRow() { Timestamp = DateTime.Parse(i[0]), Value = (long)double.Parse(i[1]) }).OrderBy(i => i.Timestamp).ToList();
+
+            return result;
         }
 
-        private static string GenerateAppInsightsQuery()
+        private static string GenerateAppInsightsPrivateBytesQuery()
         {
             // this query takes last 100 'Private Bytes' counter records records from Application Insights
             // this query summarizes (groups) values by minute (by average value) in order to make sure the data-series have minute granularity
-            // otherwise Anomaly Detector throws an exception
-            return $"https://api.applicationinsights.io/v1/apps/{AzureAiAppId}/query?query=performanceCounters | where tostring(customDimensions.Role) == 'CD' | where name == 'Private Bytes' | summarize avgValue=avg(value) by bin(timestamp, 1m) | project timestamp, tostring(avgValue) | order by timestamp desc| take 100 | order by timestamp asc";
+            // otherwise Anomaly Detector throws an exception            
+            // The query below should return at least 12 records (requirement of the Anomaly Detector) therefore please pay attention that
+            // AzureAiQueryMinutesAgo is correctly set and Application Insights has enough data
+            var timeLimitation = string.IsNullOrEmpty(AzureAiQueryMinutesAgo) ? string.Empty : $"| where timestamp > now(-{AzureAiQueryMinutesAgo}m)";
+            var query = $"https://api.applicationinsights.io/v1/apps/{AzureAiAppId}/query?query=performanceCounters " +
+                        $"{timeLimitation}" +
+                        $"| where tostring(customDimensions.Role) == 'CD' " +
+                        $"| where name == 'Private Bytes' " +
+                        $"| summarize avgValue=avg(value) by bin(timestamp, 1m) " +
+                        $"| project timestamp, tostring(avgValue) " +
+                        $"| order by timestamp desc" +
+                        $"| take 100 " +
+                        $"| order by timestamp asc";
+
+            return query;
+            //return $"https://api.applicationinsights.io/v1/apps/{AzureAiAppId}/query?query=performanceCounters | where tostring(customDimensions.Role) == 'CD' | where name == 'Private Bytes' | summarize avgValue=avg(value) by bin(timestamp, 1m) | project timestamp, tostring(avgValue) | order by timestamp desc| take 100 | order by timestamp asc";
         }
+
+        #endregion
     }
 }
